@@ -69,6 +69,15 @@ class JamaProjectCopier(JamaClient):
             super().__init__(JAMA_URL, credentials=CREDENTIALS, oauth=True)
         self.JAMA_URL = JAMA_URL
         self.target_item_types_cache = None
+        self.source_type_keys_cache = None
+
+    def source_type_key(self, source_type_id):
+        """
+        コピー元のitem type IDからtypeKeyを引く（IDはインスタンスごとに違うので、種類の判定はtypeKeyで行う）
+        """
+        if self.source_type_keys_cache is None:
+            self.source_type_keys_cache = {t.get('id'): key for key, t in self.load_source_item_types().items()}
+        return self.source_type_keys_cache.get(source_type_id, '')
 
     def print_error(self, message):
         """
@@ -216,6 +225,7 @@ class JamaProjectCopier(JamaClient):
                         try:
                             tgt_id = self.post_picklist_option(target_picklist_id, source_option_name, description, sort_order, default, value, color)
                             picklist_option_mapping[option_id] = tgt_id
+                            print(f"  Option created: '{source_option_name}' (source ID: {source_option_id} -> target ID: {tgt_id})")
 
                         except Exception as e:
                             #オプション作成に失敗したらデフォルトに集約
@@ -244,6 +254,17 @@ class JamaProjectCopier(JamaClient):
                                 color = None
                             tgt_id = self.post_picklist_option(new_picklist, name, description, sort_order, default, value, color)
                             picklist_option_mapping[option_id] = tgt_id
+
+                    # "Unassigned" はJamaがpicklist作成時に自動で作るので、名前で引き当てる
+                    skipped = [opt for opt in source_options if opt.get('id') not in picklist_option_mapping]
+                    if skipped:
+                        try:
+                            created_by_name = {o.get('name', ''): o.get('id') for o in self.get_pick_list_options(new_picklist)}
+                            for opt in skipped:
+                                if opt.get('name', '') in created_by_name:
+                                    picklist_option_mapping[opt.get('id')] = created_by_name[opt.get('name', '')]
+                        except Exception as e:
+                            self.print_warning(f"  Could not get options of new picklist {new_picklist}: {str(e)}")
 
                     print(f"Created picklist: {source_name} (source ID: {source_picklist_id} -> new ID: {new_picklist})")
                     picklist_id_mapping[source_picklist_id] = new_picklist
@@ -721,23 +742,25 @@ class JamaProjectCopier(JamaClient):
         print(f"📊 Creating mappings for {len(source_types_by_key)} source types using {len(target_types_by_key)} target types")
         print(f"📊 Exact matches: {len(exact_matches)}, Different attributes: {len(different_types)}, Missing: {len(missing_types)}")
         
-        # 1. 完全一致のマッピング
+        # 1. 完全一致のマッピング（target_idがあれば名前で引き当てた先を使う）
         for match in exact_matches:
-            type_mapping[match['id']] = match['id']
+            target_id = match.get('target_id', match['id'])
+            type_mapping[match['id']] = target_id
             mapping_log.append({
                 'source_id': match['id'],
-                'target_id': match['id'],
+                'target_id': target_id,
                 'source_name': match['name'],
                 'target_name': match['name'],
                 'mapping_type': 'exact_match'
             })
 
-        # 2. 属性が異なるが同じIDのものはそのまま使用（警告付き）
+        # 2. 属性が異なるもの（警告付き）
         for diff in different_types:
-            type_mapping[diff['id']] = diff['id']
+            target_id = diff.get('target_id', diff['id'])
+            type_mapping[diff['id']] = target_id
             mapping_log.append({
                 'source_id': diff['id'],
-                'target_id': diff['id'],
+                'target_id': target_id,
                 'source_name': diff['source_name'],
                 'target_name': diff['target_name'],
                 'mapping_type': 'forced_match',
@@ -986,46 +1009,59 @@ class JamaProjectCopier(JamaClient):
         self._save_target_relationship_types(target_relationship_types)       
         
         # 差異をチェック（フィルタリングされたタイプのみ）
+        # IDはインスタンスごとに振られるので、名前で対応付ける。
+        # 名前が同じものが複数あるときは同じIDのものを優先する。
+        # 大文字小文字だけ違う名前（'Verified by' と 'Verified By' など）は警告付きで対応付ける。
         missing_types = []
         different_types = []
         exact_matches = []
-        
+
+        def pick(candidates, source_id):
+            for t in candidates:
+                if t.get('id') == source_id:
+                    return t
+            return candidates[0] if candidates else None
+
         for type_key, source_type in filtered_source_types.items():
-            if type_key not in target_types_by_key:
-                missing_types.append({
-                    'source_id': type_key,
-                    'source_name': source_type.get('name', ''),
-                    'source_type': source_type.get('type', '')
+            source_name = source_type.get('name', '')
+            same_name = [t for t in target_types_by_key.values() if t.get('name', '') == source_name]
+            similar_name = [t for t in target_types_by_key.values()
+                            if t.get('name', '').strip().lower() == source_name.strip().lower()]
+            target_type = pick(same_name, type_key)
+            if target_type:
+                exact_matches.append({
+                    'id': type_key,
+                    'target_id': target_type.get('id'),
+                    'name': source_name
                 })
-            else:
-                # 名前や色などの基本属性を比較
-                target_type = target_types_by_key[type_key]
-                source_name = source_type.get('name', '')
-                target_name = target_type.get('name', '')
-                source_type_value = source_type.get('type', '')
-                target_type_value = target_type.get('type', '')
-                
-                if source_name != target_name or source_type_value != target_type_value:
-                    different_types.append({
-                        'id': type_key,
-                        'source_name': source_name,
-                        'target_name': target_name,
-                        'source_type': source_type_value,
-                        'target_type': target_type_value
-                    })
-                else:
-                    exact_matches.append({
-                        'id': type_key,
-                        'name': source_name
-                    })
+                continue
+            target_type = pick(similar_name, type_key)
+            if target_type:
+                different_types.append({
+                    'id': type_key,
+                    'target_id': target_type.get('id'),
+                    'source_name': source_name,
+                    'target_name': target_type.get('name', ''),
+                    'source_type': source_type.get('type', ''),
+                    'target_type': target_type.get('type', '')
+                })
+                continue
+            missing_types.append({
+                'source_id': type_key,
+                'source_name': source_name,
+                'source_type': source_type.get('type', '')
+            })
 
         # 結果の表示
         if not missing_types and not different_types:
             print("✓ All used relationship types match between source and target.")
-            # 完全一致の場合の1:1マッピングを作成
-            type_mapping = {type_info['id']: type_info['id'] for type_info in exact_matches}
+            # 名前で一致したもののマッピングを作成
+            type_mapping = {type_info['id']: type_info['target_id'] for type_info in exact_matches}
+            for type_info in exact_matches:
+                if type_info['id'] != type_info['target_id']:
+                    print(f"  🔄 '{type_info['name']}': source ID {type_info['id']} -> target ID {type_info['target_id']}")
             return True, type_mapping
-        
+
         print(f"Found relationship type differences in used types:")
         if exact_matches:
             print(f"✓ Exact matches: {len(exact_matches)}")
@@ -1186,8 +1222,11 @@ class JamaProjectCopier(JamaClient):
                     continue
                 
                 print(f"✅ Found file: {copy_from_path} ({os.path.getsize(copy_from_path)} bytes)")
-                
+
                 # 1. Jama上でのファイル名とdescriptionを決める
+                # URLから取ったファイル名はエンコード済み（%20など）なので戻す。
+                # 戻さないと Jama 上の名前に %20 が残り、下の URL では %2520 になる。
+                filename = urllib.parse.unquote(filename)
                 description = f'Copied image: {filename}'
                 
                 # 2. ProjectにATTACH FILEを登録・IDを作成する
@@ -1200,11 +1239,13 @@ class JamaProjectCopier(JamaClient):
                 temp_filename = filename
                 temp_file_path = os.path.join(os.path.dirname(copy_from_path), temp_filename)
                 shutil.copy2(copy_from_path, temp_file_path)
-                
+
                 # 4. ファイルをJamaプロジェクトにアップロードする
                 print(f"⬆️ Uploading file to Jama...")
-                upload_status = self.put_attachments_file(attach_id, temp_file_path)             
-                os.remove(temp_file_path)
+                try:
+                    upload_status = self.put_attachments_file(attach_id, temp_file_path)
+                finally:
+                    os.remove(temp_file_path)
                 
                 print(f"✅ Upload successful (status: {upload_status})")
                 
@@ -1281,15 +1322,16 @@ class JamaProjectCopier(JamaClient):
             fields = item['fields'].copy()
             old_id = item["id"]
             processed_count += 1
+            source_type_key = self.source_type_key(source_item_type)
 
-            # itemType 22 (ATTACHMENT) はコピーから除外
-            if source_item_type == 22:
+            # ATTACHMENT はコピーから除外
+            if source_type_key == 'ATT':
                 excluded_count += 1
                 print(f"Skipping ATTACHMENT item {old_id} ({item.get('fields', {}).get('name', 'Unknown')})")
                 continue
 
-            # TestPlan(35) の処理
-            if source_item_type == 35:  # TESTPLAN
+            # TestPlan の処理
+            if source_type_key == 'TSTPL':
                 try:
                     testplan_name = item.get('fields', {}).get('name', f'TestPlan_{old_id}')
                     testplan_description = item.get('fields', {}).get('description', '')
@@ -1315,13 +1357,13 @@ class JamaProjectCopier(JamaClient):
                     self.print_error(f"Error creating TestPlan {old_id}: {str(e)}")
                     continue
             
-            # TestCycle(36)、TestRun(37)は後で処理するため保存
-            if source_item_type == 36:  # TESTCYCLE
+            # TestCycle、TestRunは後で処理するため保存
+            if source_type_key == 'TSTCY':
                 testcycle_items.append(item)
                 print(f"Saved TestCycle item {old_id} for later processing")
                 continue
-                
-            if source_item_type == 37:  # TESTRUN
+
+            if source_type_key == 'TSTRN':
                 testrun_items.append(item)
                 print(f"Saved TestRun item {old_id} for later processing")
                 continue
@@ -1340,9 +1382,10 @@ class JamaProjectCopier(JamaClient):
             for type_info in self.target_item_types_cache:
                 if type_info.get('id') == target_item_type:
                     source_item_type_info = type_info
-                    type_key = source_item_type_info.get('typeKey', '').lower()
                     # SetsやFolders等は必須でchild_item_type_idが必要、ここでフラグを立てておく
-                    if 'set' in type_key or 'folder' in type_key:
+                    # （FolderのtypeKeyはFLDなので、部分一致ではなくcategory/typeKeyで判定する）
+                    if (source_item_type_info.get('category') in ('SET', 'SECTION')
+                            or source_item_type_info.get('typeKey') in ('SET', 'FLD')):
                         requires_child_type = True
                     break
             
@@ -1404,29 +1447,30 @@ class JamaProjectCopier(JamaClient):
                 # picklistオプション値のマッピングを適用（マッピングが存在する場合のみ）
                 mapped_value = field_value
                     
-                # 整数値の場合：picklistマッピングが存在するもののみ処理
-                if isinstance(field_value, int) and picklist_option_mapping and field_value in picklist_option_mapping:
-                    mapped_value = picklist_option_mapping[field_value]
+                # マッピングの無いoptionのIDはコピー元のIDのまま送らない
+                # （コピー先では別のoptionを指すか、存在しないIDになる）
+                option_mapping = picklist_option_mapping or {}
+                if isinstance(field_value, int):
+                    if field_value not in option_mapping:
+                        self.print_warning(f"Warning: Picklist option {field_value} of field '{field_name}' has no mapping. Field skipped for item {old_id}.")
+                        continue
+                    mapped_value = option_mapping[field_value]
                     print(f"🔄 Mapped picklist option: {field_name} - {field_value} -> {mapped_value}")
-                # リスト形式の場合：リスト内にマッピング対象がある場合のみ処理
-                elif isinstance(field_value, list) and len(field_value) > 0 and picklist_option_mapping:
+                elif isinstance(field_value, list):
                     mapped_list = []
-                    has_mapping = False
                     for i_val in field_value:
-                        if isinstance(i_val, int) and i_val in picklist_option_mapping:
-                            mapped_item = picklist_option_mapping[i_val]
+                        if isinstance(i_val, int) and i_val in option_mapping:
+                            mapped_item = option_mapping[i_val]
                             mapped_list.append(mapped_item)
                             print(f"🔄 Mapped picklist option in list: {field_name} - {i_val} -> {mapped_item}")
-                            has_mapping = True
                         else:
-                            mapped_list.append(i_val)
-                    if has_mapping:
-                        mapped_value = mapped_list
+                            self.print_warning(f"Warning: Picklist option {i_val} of field '{field_name}' has no mapping. Dropped for item {old_id}.")
+                    mapped_value = mapped_list
                 updated_fields[field_name] = mapped_value
 
             dct_fields = updated_fields
-            description_field = item.get('fields', {}).get('description', '')
-            
+            description_field = item.get('fields', {}).get('description') or ''
+
             #<img src= タグがdescriptionに含まれている場合、ファイルをJamaプロジェクトにアップロードしてURLを置換する
             if '<img' in description_field.lower() and 'src=' in description_field.lower():
                img_text = description_field
@@ -1749,11 +1793,17 @@ class JamaProjectCopier(JamaClient):
             print(f"Creating {folder_status}: '{project_name}' (key: '{project_key}')...")
             
             # 事前に取得したプロジェクト一覧で同じキーがないかチェック
+            # フォルダはprojectKeyを持たない(None)ので、キーが無いときはフォルダ同士を名前で比べる
             if existing_projects:
                 for existing_project in existing_projects:
                     existing_fields = existing_project.get('fields', {})
-                    existing_key = existing_fields.get('projectKey', '')
-                    if existing_key == project_key:
+                    existing_key = existing_fields.get('projectKey')
+                    if project_key:
+                        same = existing_key == project_key
+                    else:
+                        same = (bool(existing_project.get('isFolder', False)) == bool(is_folder)
+                                and existing_fields.get('name') == project_name)
+                    if same:
                         existing_id = existing_project.get('id')
                         existing_name = existing_fields.get('name', 'Unknown')
                         self.print_warning(f"⚠️ Project with key '{project_key}' already exists (ID: {existing_id}, Name: '{existing_name}')")
@@ -1763,8 +1813,13 @@ class JamaProjectCopier(JamaClient):
             # フォルダプロジェクトの場合の処理
             if is_folder:
                 print(f"📁 Creating project folder: '{project_name}'")
-                # フォルダプロジェクトを作成し、IDマッピングを保持
-                created_project_id = self.post_project(project_key, project_name, is_folder=True)
+                # フォルダプロジェクトを作成し、IDマッピングを保持（フォルダの中のフォルダは親を引き継ぐ）
+                new_parent_id = None
+                if parent_id and project_folder_mapping and parent_id in project_folder_mapping:
+                    new_parent_id = project_folder_mapping[parent_id]
+                elif parent_id:
+                    self.print_warning(f"Warning: Parent folder {parent_id} not found in project folder mapping. Creating as root folder.")
+                created_project_id = self.post_project(project_key, project_name, is_folder=True, parent_id=new_parent_id)
                 print(f"📁 Created project folder '{project_name}' (key: '{project_key}') with ID: {created_project_id}")
                 return created_project_id
             
@@ -1831,7 +1886,7 @@ class JamaProjectCopier(JamaClient):
         
         if not created_items:
             self.print_warning("No items were created. Aborting relation creation.")
-            return False
+            return False, target_project_id
 
         # 関係をコピー（relationship typeマッピング付き）
         created_relations, skipped_relations = self.copy_relations(relations_data, old_id_to_new_id, relationship_type_mapping)
@@ -1928,6 +1983,17 @@ def main():
             else:
                 regular_projects.append(source_project_id)
         
+        # 親フォルダを先に作る（フォルダの中のフォルダはIDの順では親より先に来ることがある）
+        def folder_depth(pid):
+            depth, seen = 0, set()
+            parent = project_infos[pid].get('parent_id')
+            while parent in project_infos and parent not in seen:
+                seen.add(parent)
+                depth += 1
+                parent = project_infos[parent].get('parent_id')
+            return depth
+        folder_projects.sort(key=folder_depth)
+
         print(f"📋 Project structure: {len(folder_projects)} folders, {len(regular_projects)} regular projects")
         
         # コピー先の既存プロジェクト一覧を一度だけ取得
