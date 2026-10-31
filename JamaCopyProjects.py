@@ -166,6 +166,37 @@ class JamaProjectCopier(JamaClient):
             self.print_error(f"Error getting target pick lists: {str(e)}")
             raise Exception(f"Login failed. Check your credentials: {str(e)}")
 
+    def post_picklist_option_safe(self, picklist_id, name, description, sort_order, default, value, color):
+        """
+        picklist optionを作成する。色がコピー先で使えない場合は、使える色のうち一番近い色で作り直す。
+        Jamaの色は決まった値しか受け付けず、受け付ける値はエラーメッセージに並ぶ。
+        """
+        try:
+            return self.post_picklist_option(picklist_id, name, description, sort_order, default, value, color)
+        except Exception as e:
+            msg = str(e)
+            if not color or 'PickListOptionColor' not in msg:
+                raise
+            m = re.search(r'Enum class:\s*\[([0-9A-Fa-f,\s]+)\]', msg)
+            allowed = [c.strip() for c in m.group(1).split(',') if c.strip()] if m else []
+            new_color = self._nearest_color(color, allowed)
+            self.print_warning(f"  Color '{color}' of option '{name}' is not accepted. Using '{new_color}' instead.")
+            return self.post_picklist_option(picklist_id, name, description, sort_order, default, value, new_color)
+
+    @staticmethod
+    def _nearest_color(color, allowed):
+        """
+        RGBの距離で一番近い色を返す。比べられないときはNone（色なし）
+        """
+        def rgb(c):
+            c = c.lstrip('#')
+            return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+        try:
+            src = rgb(color)
+            return min(allowed, key=lambda c: sum((a - b) ** 2 for a, b in zip(src, rgb(c))))
+        except (ValueError, TypeError):
+            return None
+
     def create_picklist_mappings(self, source_picklists_by_id, target_picklists_by_id):
         """
         sourceとtargetのpicklistとpicklist optionsのマッピングを作成する
@@ -223,7 +254,7 @@ class JamaProjectCopier(JamaClient):
                             color = None
 
                         try:
-                            tgt_id = self.post_picklist_option(target_picklist_id, source_option_name, description, sort_order, default, value, color)
+                            tgt_id = self.post_picklist_option_safe(target_picklist_id, source_option_name, description, sort_order, default, value, color)
                             picklist_option_mapping[option_id] = tgt_id
                             print(f"  Option created: '{source_option_name}' (source ID: {source_option_id} -> target ID: {tgt_id})")
 
@@ -239,39 +270,44 @@ class JamaProjectCopier(JamaClient):
             else:
                 try:
                     new_picklist = self.post_picklist(name=source_name, description=source_picklist.get('description', ''))
-                    for opt in source_options:
-                        if opt['name'] != "Unassigned":
-                            name = opt['name']
-                            description = opt.get('description', '')
-                            sort_order = opt.get('sortOrder', 0)
-                            default = opt.get('default', False)
-                            option_id = opt.get('id')
-                            value = opt.get('value')
-                            if value == "":
-                                value = None
-                            color = opt.get('color')
-                            if color == "":
-                                color = None
-                            tgt_id = self.post_picklist_option(new_picklist, name, description, sort_order, default, value, color)
-                            picklist_option_mapping[option_id] = tgt_id
-
-                    # "Unassigned" はJamaがpicklist作成時に自動で作るので、名前で引き当てる
-                    skipped = [opt for opt in source_options if opt.get('id') not in picklist_option_mapping]
-                    if skipped:
-                        try:
-                            created_by_name = {o.get('name', ''): o.get('id') for o in self.get_pick_list_options(new_picklist)}
-                            for opt in skipped:
-                                if opt.get('name', '') in created_by_name:
-                                    picklist_option_mapping[opt.get('id')] = created_by_name[opt.get('name', '')]
-                        except Exception as e:
-                            self.print_warning(f"  Could not get options of new picklist {new_picklist}: {str(e)}")
-
-                    print(f"Created picklist: {source_name} (source ID: {source_picklist_id} -> new ID: {new_picklist})")
-                    picklist_id_mapping[source_picklist_id] = new_picklist
-
                 except Exception as e:
                     self.print_error(f"Failed to create picklist '{source_name}' for source ID {source_picklist_id}: {str(e)}")
                     continue
+
+                # picklistはもう作られているので、optionが1つ作れなくてもマッピングは残す
+                # （残さないと、このpicklistを使うフィールドがpicklist無しで作られる）
+                picklist_id_mapping[source_picklist_id] = new_picklist
+                for opt in source_options:
+                    if opt['name'] != "Unassigned":
+                        name = opt['name']
+                        description = opt.get('description', '')
+                        sort_order = opt.get('sortOrder', 0)
+                        default = opt.get('default', False)
+                        option_id = opt.get('id')
+                        value = opt.get('value')
+                        if value == "":
+                            value = None
+                        color = opt.get('color')
+                        if color == "":
+                            color = None
+                        try:
+                            tgt_id = self.post_picklist_option_safe(new_picklist, name, description, sort_order, default, value, color)
+                            picklist_option_mapping[option_id] = tgt_id
+                        except Exception as e:
+                            self.print_error(f"  Failed to create option '{name}' of picklist '{source_name}': {str(e)}")
+
+                # "Unassigned" はJamaがpicklist作成時に自動で作るので、名前で引き当てる
+                skipped = [opt for opt in source_options if opt.get('id') not in picklist_option_mapping]
+                if skipped:
+                    try:
+                        created_by_name = {o.get('name', ''): o.get('id') for o in self.get_pick_list_options(new_picklist)}
+                        for opt in skipped:
+                            if opt.get('name', '') in created_by_name:
+                                picklist_option_mapping[opt.get('id')] = created_by_name[opt.get('name', '')]
+                    except Exception as e:
+                        self.print_warning(f"  Could not get options of new picklist {new_picklist}: {str(e)}")
+
+                print(f"Created picklist: {source_name} (source ID: {source_picklist_id} -> new ID: {new_picklist})")
 
         print(f"Created {len(picklist_id_mapping)} picklist mappings and {len(picklist_option_mapping)} option mappings")
         return picklist_id_mapping, picklist_option_mapping
@@ -947,8 +983,14 @@ class JamaProjectCopier(JamaClient):
         childItemTypeで参照されているタイプも含めてマッピングを作成する
         """
         print("\n=== Creating Filtered Type Mappings ===")
-        
-        # PickListマッピングの作成（最初に処理）
+
+        # Relationship Typeは作れないので最初に確かめる（足りなければコピー先に何も作らずに止める）
+        print(f"\nProcessing {len(used_relationship_types)} used relationship types...")
+        relationship_validation_success, relationship_type_mapping = self.validate_filtered_relationship_types(used_relationship_types)
+        if not relationship_validation_success:
+            return {}, [], False, {}, {}, {}
+
+        # PickListマッピングの作成
         print(f"\nProcessing PickList mappings first...")
         source_picklists_by_id = self.load_source_picklists()
         target_picklists_by_id = self.get_target_picklists()
@@ -972,11 +1014,7 @@ class JamaProjectCopier(JamaClient):
         # フィールド比較・追加処理（picklistマッピング利用可能）
         print(f"\n🔍 Comparing and adding missing fields...")
         self.synchronize_item_type_fields(filtered_source_types, target_types_by_key, type_id_mapping, picklist_id_mapping)
-        
-        # Relationship Typeマッピングの作成
-        print(f"\nProcessing {len(used_relationship_types)} used relationship types...")
-        relationship_validation_success, relationship_type_mapping = self.validate_filtered_relationship_types(used_relationship_types)
-        
+
         return type_id_mapping, created_types, relationship_validation_success, relationship_type_mapping, picklist_id_mapping, picklist_option_mapping
 
     def validate_filtered_relationship_types(self, used_relationship_types):
@@ -1074,10 +1112,18 @@ class JamaProjectCopier(JamaClient):
             for diff in different_types:
                 print(f"  - {diff['id']}: '{diff['source_name']}' vs '{diff['target_name']}' (type: {diff['source_type']} vs {diff['target_type']})")
 
+        # 名前で対応付けられないタイプがあれば止める。
+        # 似た名前で当て推量すると、'Derived from' が無関係なタイプのトレースになって黙って入る。
+        if missing_types:
+            names = ", ".join(f"'{m['source_name']}'" for m in missing_types)
+            self.print_error(f"Relationship types not found in target: {names}")
+            self.print_error("Add them in Jama Admin > Relationships (same names), then run again.")
+            return False, {}
+
         # 自動マッピングを実行
         print("\n=== Auto-mapping Used Relationship Types ===")
         type_mapping = self._create_automatic_mapping(
-            filtered_source_types, target_types_by_key, 
+            filtered_source_types, target_types_by_key,
             exact_matches, missing_types, different_types
         )
         return True, type_mapping
@@ -1583,17 +1629,23 @@ class JamaProjectCopier(JamaClient):
                         for testgroup in testgroups:
                             testgroup_id = testgroup.get('id')
                             testgroup_name = testgroup.get('name', '')
-                            
-                            # "Default Test Group" はスキップ
-                            if testgroup_name == "Default Test Group":
-                                print(f"  Skipping Default Test Group (ID: {testgroup_id})")
-                                continue
-                            
+
                             try:
-                                print(f"  Creating TestGroup: '{testgroup_name}' (old ID: {testgroup_id})")
-                                new_testgroup_id = self.post_testgroup(new_testplan_id, testgroup_name)
+                                # "Default Test Group" はテストプランを作ると Jama が自動で作るので、それを使う。
+                                # 飛ばすと中のテストケースが入らず、テストサイクルが作れない。
+                                new_testgroup_id = None
+                                if testgroup_name == "Default Test Group":
+                                    for tg in self.get_testgroups(new_testplan_id):
+                                        if tg.get('name') == testgroup_name:
+                                            new_testgroup_id = tg.get('id')
+                                            break
+                                    if new_testgroup_id:
+                                        print(f"  Using existing Default Test Group (old ID: {testgroup_id} -> new ID: {new_testgroup_id})")
+                                if not new_testgroup_id:
+                                    print(f"  Creating TestGroup: '{testgroup_name}' (old ID: {testgroup_id})")
+                                    new_testgroup_id = self.post_testgroup(new_testplan_id, testgroup_name)
+                                    print(f"  Created TestGroup: '{testgroup_name}' (old ID: {testgroup_id} -> new ID: {new_testgroup_id})")
                                 testgroup_id_mapping[testgroup_id] = new_testgroup_id
-                                print(f"  Created TestGroup: '{testgroup_name}' (old ID: {testgroup_id} -> new ID: {new_testgroup_id})")
                                 
                                 # TestCase の処理
                                 testcases_file = os.path.join("copy_from\\project_setting", f"project_{source_project_id}_testGroup_{testgroup_id}_testcases.json")
@@ -1744,8 +1796,18 @@ class JamaProjectCopier(JamaClient):
             new_to_item = old_id_to_new_id[old_to_item]
             
             # Relationship typeのマッピング適用
+            # マッピングに無いタイプを元のIDのまま送ると、コピー先で別のタイプに当たることがある。
             new_relationship_type = old_relationship_type
-            if relationship_type_mapping and old_relationship_type in relationship_type_mapping:
+            if relationship_type_mapping:
+                if old_relationship_type not in relationship_type_mapping:
+                    self.print_warning(f"Warning: relationship type {old_relationship_type} has no mapping. Skipping relation {old_from_item} -> {old_to_item}.")
+                    skipped_relations.append({
+                        'reason': 'relationship_type_not_mapped',
+                        'old_from_item': old_from_item,
+                        'old_to_item': old_to_item,
+                        'relationship_type': old_relationship_type
+                    })
+                    continue
                 new_relationship_type = relationship_type_mapping[old_relationship_type]
                 print(f"🔄 Mapping relationship type: {old_relationship_type} -> {new_relationship_type}")
             
